@@ -35,7 +35,7 @@ const PORT = process.env.PORT || 5000;
 
 const allowedOrigins = [
   'http://localhost:5173',
-  'https://upskale-demo.netlify.app',
+  'https://upskal.netlify.app',
   'https://upskale.co'
 ];
 
