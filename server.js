@@ -80,37 +80,39 @@ const otpVerifyLimiter = rateLimit({
 });
 
 
-
 app.post('/api/send-otp', otpSendLimiter, async (req, res) => {
     let { phone } = req.body;
     
     if (!phone) return res.status(400).json({ message: "Phone number required" });
 
-    // 🔴 Force E.164 Format (+91XXXXXXXXXX)
+    // Force E.164 Format
     let cleanPhone = phone.replace(/[\s-]/g, '');
-    
-    if (cleanPhone.length === 10) {
-        cleanPhone = `+91${cleanPhone}`; 
-    } else if (cleanPhone.length === 12 && cleanPhone.startsWith('91')) {
-        cleanPhone = `+${cleanPhone}`;   
-    }
+    if (cleanPhone.length === 10) cleanPhone = `+91${cleanPhone}`; 
+    else if (cleanPhone.length === 12 && cleanPhone.startsWith('91')) cleanPhone = `+${cleanPhone}`;   
 
     if (!cleanPhone.startsWith('+91') || cleanPhone.length !== 13) {
         return res.status(400).json({ message: "Invalid phone number format. Require 10 digits." });
     }
 
     try {
-        console.log(`[Twilio Verify] Sending OTP to: ${cleanPhone}`);
+        // 🛑 BYPASS TWILIO: Generate a random 6-digit OTP
+        const generatedOtp = Math.floor(100000 + Math.random() * 900000).toString();
         
-        // 🔴 TWILIO VERIFY API: Twilio handles generating and storing the OTP automatically
-        const verification = await client.verify.v2.services(process.env.TWILIO_VERIFY_SERVICE_SID)
-            .verifications
-            .create({ to: cleanPhone, channel: 'sms' });
+        // Save to temporary memory, expires in 5 minutes
+        tempOtpStore.set(cleanPhone, generatedOtp);
+        setTimeout(() => tempOtpStore.delete(cleanPhone), 5 * 60 * 1000);
 
-        res.json({ success: true, message: "OTP Sent Successfully", status: verification.status });
+        // 🔴 LOG TO CONSOLE
+        console.log(`\n========================================`);
+        console.log(`🛑 TWILIO BYPASS ACTIVE`);
+        console.log(`📱 Sending OTP to: ${cleanPhone}`);
+        console.log(`🔑 YOUR OTP IS:    ${generatedOtp}`);
+        console.log(`========================================\n`);
+
+        res.json({ success: true, message: "OTP logged in server console", status: 'pending' });
     } catch (error) {
-        console.error("❌ Twilio Send Error:", error.message);
-        res.status(500).json({ message: "Failed to send OTP", error: error.message });
+        console.error("❌ Send Error:", error.message);
+        res.status(500).json({ message: "Failed to generate OTP", error: error.message });
     }
 });
 
@@ -119,30 +121,25 @@ app.post('/api/verify-otp', otpVerifyLimiter, async (req, res) => {
 
     if (!phone || !otp) return res.status(400).json({ message: "Phone and OTP required" });
 
-    // 🔴 Format the incoming number exactly like we did in send-otp
     let cleanPhone = phone.replace(/[\s-]/g, '');
-    if (cleanPhone.length === 10) {
-        cleanPhone = `+91${cleanPhone}`;
-    } else if (cleanPhone.length === 12 && cleanPhone.startsWith('91')) {
-        cleanPhone = `+${cleanPhone}`;
-    }
+    if (cleanPhone.length === 10) cleanPhone = `+91${cleanPhone}`;
+    else if (cleanPhone.length === 12 && cleanPhone.startsWith('91')) cleanPhone = `+${cleanPhone}`;
 
     try {
-        // 🔴 TWILIO VERIFY API: Ask Twilio to check if the code the user typed is correct
-        const verification_check = await client.verify.v2.services(process.env.TWILIO_VERIFY_SERVICE_SID)
-            .verificationChecks
-            .create({ to: cleanPhone, code: otp });
+        // 🛑 BYPASS TWILIO: Check our temporary memory store
+        const validOtp = tempOtpStore.get(cleanPhone);
 
-        // If Twilio says it's wrong or expired, reject it
-        if (verification_check.status !== 'approved') {
+        if (!validOtp || validOtp !== otp.toString()) {
             return res.status(400).json({ message: "Invalid or Expired OTP" });
         }
 
-        // 🔴 OTP IS VALID. Proceed to lookup user in your DB.
+        // OTP matches. Clear it from memory so it can't be reused.
+        tempOtpStore.delete(cleanPhone);
+
+        // Proceed to lookup user in DB
         const user = await User.findOne({ phone: cleanPhone }); 
         
         if (user) {
-            // EXISTING USER LOGIN
             const token = jwt.sign(
                 { id: user._id, role: user.role }, 
                 process.env.JWT_SECRET, 
@@ -158,14 +155,99 @@ app.post('/api/verify-otp', otpVerifyLimiter, async (req, res) => {
 
             return res.json({ message: "Login Success", isNewUser: false, user });
         } else {
-            // NEW USER PROCEED TO PROFILE COMPLETION
             return res.json({ message: "OTP Verified", isNewUser: true });
         }
     } catch (error) {
         console.error("❌ Verify Error:", error.message);
-        res.status(500).json({ message: "Verification process failed. Double check your code." });
+        res.status(500).json({ message: "Verification process failed." });
     }
 });
+
+// app.post('/api/send-otp', otpSendLimiter, async (req, res) => {
+//     let { phone } = req.body;
+    
+//     if (!phone) return res.status(400).json({ message: "Phone number required" });
+
+//     // 🔴 Force E.164 Format (+91XXXXXXXXXX)
+//     let cleanPhone = phone.replace(/[\s-]/g, '');
+    
+//     if (cleanPhone.length === 10) {
+//         cleanPhone = `+91${cleanPhone}`; 
+//     } else if (cleanPhone.length === 12 && cleanPhone.startsWith('91')) {
+//         cleanPhone = `+${cleanPhone}`;   
+//     }
+
+//     if (!cleanPhone.startsWith('+91') || cleanPhone.length !== 13) {
+//         return res.status(400).json({ message: "Invalid phone number format. Require 10 digits." });
+//     }
+
+//     try {
+//         console.log(`[Twilio Verify] Sending OTP to: ${cleanPhone}`);
+        
+//         // 🔴 TWILIO VERIFY API: Twilio handles generating and storing the OTP automatically
+//         const verification = await client.verify.v2.services(process.env.TWILIO_VERIFY_SERVICE_SID)
+//             .verifications
+//             .create({ to: cleanPhone, channel: 'sms' });
+
+//         res.json({ success: true, message: "OTP Sent Successfully", status: verification.status });
+//     } catch (error) {
+//         console.error("❌ Twilio Send Error:", error.message);
+//         res.status(500).json({ message: "Failed to send OTP", error: error.message });
+//     }
+// });
+
+// app.post('/api/verify-otp', otpVerifyLimiter, async (req, res) => {
+//     let { phone, otp } = req.body;
+
+//     if (!phone || !otp) return res.status(400).json({ message: "Phone and OTP required" });
+
+//     // 🔴 Format the incoming number exactly like we did in send-otp
+//     let cleanPhone = phone.replace(/[\s-]/g, '');
+//     if (cleanPhone.length === 10) {
+//         cleanPhone = `+91${cleanPhone}`;
+//     } else if (cleanPhone.length === 12 && cleanPhone.startsWith('91')) {
+//         cleanPhone = `+${cleanPhone}`;
+//     }
+
+//     try {
+//         // 🔴 TWILIO VERIFY API: Ask Twilio to check if the code the user typed is correct
+//         const verification_check = await client.verify.v2.services(process.env.TWILIO_VERIFY_SERVICE_SID)
+//             .verificationChecks
+//             .create({ to: cleanPhone, code: otp });
+
+//         // If Twilio says it's wrong or expired, reject it
+//         if (verification_check.status !== 'approved') {
+//             return res.status(400).json({ message: "Invalid or Expired OTP" });
+//         }
+
+//         // 🔴 OTP IS VALID. Proceed to lookup user in your DB.
+//         const user = await User.findOne({ phone: cleanPhone }); 
+        
+//         if (user) {
+//             // EXISTING USER LOGIN
+//             const token = jwt.sign(
+//                 { id: user._id, role: user.role }, 
+//                 process.env.JWT_SECRET, 
+//                 { expiresIn: '7d' }
+//             );
+
+//             res.cookie('jwt', token, {
+//                 httpOnly: true,
+//                 secure: true, 
+//                 sameSite: 'none',
+//                 maxAge: 7 * 24 * 60 * 60 * 1000
+//             });
+
+//             return res.json({ message: "Login Success", isNewUser: false, user });
+//         } else {
+//             // NEW USER PROCEED TO PROFILE COMPLETION
+//             return res.json({ message: "OTP Verified", isNewUser: true });
+//         }
+//     } catch (error) {
+//         console.error("❌ Verify Error:", error.message);
+//         res.status(500).json({ message: "Verification process failed. Double check your code." });
+//     }
+// });
 
 // ==========================================
 // 👤 USER PROFILE & REGISTRATION (PUBLIC)
