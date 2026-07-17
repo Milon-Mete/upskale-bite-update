@@ -9,6 +9,7 @@ const axios = require('axios');
 const twilio = require('twilio');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const cron = require('node-cron');
 // 🛑 TEMPORARY TWILIO BYPASS STORE
 const tempOtpStore = new Map();
 
@@ -30,7 +31,19 @@ const BiteSizeCourse = require('./models/BiteSizeCourse');
 const Otp = require('./models/Otp')
 
 const app = express();
-app.use(helmet());
+// 🔒 SECURITY: Configure Content Security Policy for Razorpay & external services
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", "'unsafe-inline'", "https://checkout.razorpay.com", "https://cdn.razorpay.com"],
+            frameSrc: ["'self'", "https://api.razorpay.com", "https://checkout.razorpay.com"],
+            imgSrc: ["'self'", "data:", "https://res.cloudinary.com", "https://*.cloudinary.com"],
+            connectSrc: ["'self'", "http://localhost:5000", "https://api.upskale.co", "https://upskale-1.onrender.com"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+        },
+    },
+}));
 const PORT = process.env.PORT || 5000;
 
 const allowedOrigins = [
@@ -802,5 +815,47 @@ app.use('/api/promotions', require('./routes/promotion'));
 app.use('/api/cohorts', require('./routes/cohortRoutes')) 
 app.use('/api/bitesize-courses', require('./routes/biteSizeRoutes'));
 app.use('/api/engagement', require('./routes/engagement'));
+
+// =============================================
+// 🔄 SUBSCRIPTION AUTO-EXPIRY CRON JOB
+// =============================================
+// Runs every day at midnight (00:00) to expire subscriptions
+cron.schedule('0 0 * * *', async () => {
+    try {
+        const now = new Date();
+        const result = await User.updateMany(
+            { 
+                "biteSizeSubscription.status": "active", 
+                "biteSizeSubscription.expiresAt": { $lte: now } 
+            },
+            { 
+                $set: { "biteSizeSubscription.status": "inactive" } 
+            }
+        );
+        
+        if (result.modifiedCount > 0) {
+            console.log(`🔄 Auto-expired ${result.modifiedCount} subscription(s) at ${now.toISOString()}`);
+        }
+    } catch (err) {
+        console.error("❌ Cron: Subscription expiry check failed:", err.message);
+    }
+});
+
+// =============================================
+// 📊 HEALTH CHECK ENDPOINT
+// =============================================
+app.get('/api/health', async (req, res) => {
+    try {
+        const dbState = mongoose.connection.readyState;
+        res.json({
+            status: 'ok',
+            timestamp: new Date().toISOString(),
+            database: dbState === 1 ? 'connected' : 'disconnected',
+            uptime: process.uptime()
+        });
+    } catch (err) {
+        res.status(500).json({ status: 'error', message: err.message });
+    }
+});
 
 app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));

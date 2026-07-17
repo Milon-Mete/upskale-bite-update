@@ -73,4 +73,9 @@ const userSchema = new mongoose.Schema({
 
 }, { timestamps: true });
 
+// 🔍 Performance indexes for subscription queries
+userSchema.index({ "biteSizeSubscription.planType": 1 });
+userSchema.index({ "biteSizeSubscription.expiresAt": 1 });
+userSchema.index({ "biteSizeSubscription.status": 1, "biteSizeSubscription.expiresAt": 1 });
+
 module.exports = mongoose.models.User || mongoose.model('User', userSchema);
