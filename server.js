@@ -74,7 +74,17 @@ app.use(cookieParser()); // 🔴 READS COOKIES
 
 // --- DATABASE CONNECTION ---
 mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log("✅ MongoDB Connected"))
+    .then(async () => {
+        console.log("✅ MongoDB Connected");
+        // 🔴 Fix: Drop old phone_1 unique index and recreate with sparse:true
+        // This allows multiple Google users (phone=null) without duplicate key errors
+        try {
+            await User.syncIndexes();
+            console.log("✅ Indexes synced (phone sparse index applied)");
+        } catch (idxErr) {
+            console.warn("⚠️ Index sync warning (non-critical):", idxErr.message);
+        }
+    })
     .catch(err => console.error("❌ DB Error:", err));
 
 const otpSendLimiter = rateLimit({
@@ -263,8 +273,167 @@ app.post('/api/verify-otp', otpVerifyLimiter, async (req, res) => {
 // });
 
 // ==========================================
+// 🟢 GOOGLE OAUTH ROUTES
+// ==========================================
+
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REDIRECT_URI = `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/auth/google/callback`;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+// Step 1: Redirect user to Google consent screen
+app.get('/api/auth/google', (req, res) => {
+    const params = new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID,
+        redirect_uri: GOOGLE_REDIRECT_URI,
+        response_type: 'code',
+        scope: 'openid email profile',
+        access_type: 'offline',
+        prompt: 'select_account'
+    });
+    res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+});
+
+// Step 2: Google redirects back here with a code
+app.get('/api/auth/google/callback', async (req, res) => {
+    const { code, error: oauthError } = req.query;
+
+    if (oauthError || !code) {
+        console.error('❌ Google OAuth error:', oauthError);
+        return res.redirect(`${FRONTEND_URL}/login?error=google_auth_failed`);
+    }
+
+    try {
+        // Exchange authorization code for tokens
+        const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', {
+            code,
+            client_id: GOOGLE_CLIENT_ID,
+            client_secret: GOOGLE_CLIENT_SECRET,
+            redirect_uri: GOOGLE_REDIRECT_URI,
+            grant_type: 'authorization_code'
+        }, {
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        const { id_token, access_token } = tokenResponse.data;
+
+        // Get user info from Google
+        const userInfoResponse = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
+            headers: { Authorization: `Bearer ${access_token}` }
+        });
+
+        const { id: googleId, name, email, picture } = userInfoResponse.data;
+
+        if (!googleId || !email) {
+            return res.redirect(`${FRONTEND_URL}/login?error=missing_google_data`);
+        }
+
+        // Find existing user — first by googleId, then by email (any auth method)
+        let user = await User.findOne({ googleId });
+
+        if (!user && email) {
+            // If no user found by googleId, check if email already exists
+            // (e.g., user signed up with phone first, or this is a new Google user)
+            user = await User.findOne({ email });
+        }
+
+        if (user) {
+            // Link Google account to existing user (phone or existing Google user)
+            if (!user.googleId) {
+                user.googleId = googleId;
+                // Don't change authProvider — keep original signup method
+                // User now has BOTH login methods available
+                await user.save();
+            }
+        } else {
+            // Create new Google user (phone is not required, will ask later)
+            user = new User({
+                name: name || 'Google User',
+                email,
+                googleId,
+                authProvider: 'google',
+                phone: null,
+                role: 'student'
+            });
+            await user.save();
+        }
+
+        // Determine if this is a new Google user needing phone
+        const isNewGoogleUser = !user.phone;
+
+        // Generate JWT and set cookie
+        const token = jwt.sign(
+            { id: user._id, role: user.role },
+            process.env.JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+
+        res.cookie('jwt', token, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+            maxAge: 7 * 24 * 60 * 60 * 1000
+        });
+
+        // Redirect to frontend with only essential user fields (no full document exposure)
+        const safeUser = {
+            _id: user._id,
+            name: user.name,
+            email: user.email,
+            authProvider: user.authProvider,
+            phone: user.phone,
+            role: user.role
+        };
+        const userJson = encodeURIComponent(JSON.stringify(safeUser));
+        const newUserParam = isNewGoogleUser ? '&isNewGoogleUser=true' : '';
+        res.redirect(`${FRONTEND_URL}/profile?googleLogin=success&user=${userJson}${newUserParam}`);
+
+    } catch (err) {
+        console.error('❌ Google OAuth callback error:', err.message);
+        res.redirect(`${FRONTEND_URL}/login?error=google_auth_error`);
+    }
+});
+
+// ==========================================
 // 👤 USER PROFILE & REGISTRATION (PUBLIC)
 // ==========================================
+
+// 🔴 Complete Google profile (phone, age, gender) for new Google users
+app.post('/api/auth/complete-google-profile', requireAuth, async (req, res) => {
+    try {
+        const { phone, age, gender } = req.body;
+
+        if (!phone) {
+            return res.status(400).json({ message: "Phone number is required" });
+        }
+
+        // Format phone to E.164
+        let cleanPhone = phone.replace(/[\s-]/g, '');
+        if (cleanPhone.length === 10) cleanPhone = `+91${cleanPhone}`;
+        else if (cleanPhone.length === 12 && cleanPhone.startsWith('91')) cleanPhone = `+${cleanPhone}`;
+
+        if (!cleanPhone.startsWith('+91') || cleanPhone.length !== 13) {
+            return res.status(400).json({ message: "Invalid phone number format. Require 10 digits." });
+        }
+
+        // Check phone is not taken by another user
+        const existingUser = await User.findOne({ phone: cleanPhone, _id: { $ne: req.user._id } });
+        if (existingUser) {
+            return res.status(400).json({ message: "Phone number already in use by another account" });
+        }
+
+        const user = await User.findByIdAndUpdate(
+            req.user._id,
+            { phone: cleanPhone, age, gender },
+            { new: true }
+        );
+
+        res.json({ success: true, message: "Profile completed", user });
+    } catch (err) {
+        console.error('❌ Complete Google profile error:', err.message);
+        res.status(500).json({ message: "Server error" });
+    }
+});
 
 app.post('/api/complete-profile', async (req, res) => {
     try {
@@ -330,6 +499,45 @@ app.post('/api/logout', (req, res) => {
 // ==========================================
 // USER & ADMIN QUERIES (SECURED)
 // ==========================================
+
+// ==========================================
+// 👤 UPDATE USER PROFILE (name, age, gender only)
+// ==========================================
+app.put('/api/user/:id', requireAuth, async (req, res) => {
+    try {
+        // Users can only update their own profile (admin can update anyone)
+        if (req.user._id.toString() !== req.params.id && req.user.role !== 'admin') {
+            return res.status(403).json({ message: "Forbidden. You can only edit your own profile." });
+        }
+
+        const { name, age, gender } = req.body;
+
+        // Only allow updating name, age, gender
+        const updates = {};
+        if (name !== undefined) updates.name = name;
+        if (age !== undefined) updates.age = age;
+        if (gender !== undefined) updates.gender = gender;
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({ message: "No valid fields to update" });
+        }
+
+        const updatedUser = await User.findByIdAndUpdate(
+            req.params.id,
+            { $set: updates },
+            { new: true, runValidators: true }
+        ).select('-password');
+
+        if (!updatedUser) {
+            return res.status(404).json({ message: "User not found" });
+        }
+
+        res.json({ success: true, user: updatedUser });
+    } catch (err) {
+        console.error("Update Profile Error:", err);
+        res.status(500).json({ message: "Server Error" });
+    }
+});
 
 app.get('/api/user/:id', requireAuth, async (req, res) => {
     try {

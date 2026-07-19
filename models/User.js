@@ -3,11 +3,13 @@ const mongoose = require('mongoose');
 
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
-  phone: { type: String, required: true, unique: true },
+  phone: { type: String, sparse: true, default: null },
   email: { type: String, default: null },
   age: { type: Number, default: null },
   gender: { type: String, default: null },
-  referredBy: { type: String, default: null }, // Keeps the original referrer's ID or Phone
+  googleId: { type: String, sparse: true, default: null },
+  authProvider: { type: String, enum: ['phone', 'google'], default: 'phone' },
+  referredBy: { type: String, default: null },
   role: { type: String, enum: ['student', 'admin', 'instructor'], default: 'student' },
 
   // --- ENROLLMENTS ARRAY (Legacy Courses & Ghost Records) ---

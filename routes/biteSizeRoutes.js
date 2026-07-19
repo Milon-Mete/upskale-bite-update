@@ -37,49 +37,75 @@ const findModuleInCourse = (course, chapterId, moduleId) => {
     return { chapter, module: mod };
 };
 
-// Auto-assign the last module in the last chapter as the certificate module
+// Auto-assign the last Module (chapter) as the Certificate Module
 const reassignCertificateModule = (course) => {
-    // Clear all certificate flags
+    // Clear all certificate flags from all Modules
     for (const ch of course.chapters) {
-        for (const mod of ch.modules) {
-            mod.isCertificateModule = false;
-        }
+        ch.isCertificateModule = false;
     }
-    // Find the very last module across all chapters
+    // Find the very last Module (chapter) — that is the Certificate Module
     const lastChapter = course.chapters[course.chapters.length - 1];
-    if (lastChapter && lastChapter.modules.length > 0) {
-        const lastModule = lastChapter.modules[lastChapter.modules.length - 1];
-        lastModule.isCertificateModule = true;
+    if (lastChapter) {
+        lastChapter.isCertificateModule = true;
     }
 };
 
-// Auto-create a certificate quiz module if the last module isn't already a quiz with questions
+// Ensure the Certificate Module is always the very last Module in the course
+// A Certificate Module is a Module (DB chapter) with isCertificateModule: true
+// that contains a single quiz chapter for certificate confirmation
 const ensureCertificateQuiz = (course) => {
     if (!course.chapters || course.chapters.length === 0) return;
 
     const lastChapter = course.chapters[course.chapters.length - 1];
-    const lastModule = lastChapter.modules[lastChapter.modules.length - 1];
 
-    // Check if the last module is already a valid certificate quiz
-    if (lastModule && lastModule.type === 'quiz' && lastModule.questions && lastModule.questions.length > 0) {
-        // It's a quiz with questions — just tag it as certificate
+    // Check if the last Module is already the Certificate Module
+    if (lastChapter && lastChapter.isCertificateModule) {
+        // Already correct — just clean up flags
         reassignCertificateModule(course);
         return;
     }
 
-    // Auto-create a certificate quiz module as the last module
-    const certQuiz = {
-        type: 'quiz',
-        order: lastChapter.modules.length,
-        isCertificateModule: true,
-        questions: [{
-            questionText: 'Thank you for completing this course! Type "YES" below to confirm and receive your certificate.',
-            options: ['YES', 'NO'],
-            correctAnswer: 'YES'
-        }]
-    };
+    // Search for any existing Certificate Module (isCertificateModule: true) in any position
+    let existingCertChapterIndex = -1;
+    for (let ci = 0; ci < course.chapters.length; ci++) {
+        if (course.chapters[ci].isCertificateModule) {
+            existingCertChapterIndex = ci;
+            break;
+        }
+    }
 
-    lastChapter.modules.push(certQuiz);
+    if (existingCertChapterIndex >= 0) {
+        // Found an existing Certificate Module — move it to the very end
+        const certModule = course.chapters.splice(existingCertChapterIndex, 1)[0];
+        certModule.order = course.chapters.length;
+        course.chapters.push(certModule);
+    } else {
+        // No Certificate Module exists — auto-create one with a quiz chapter inside
+        const certQuizChapter = {
+            type: 'quiz',
+            order: 0,
+            questions: [{
+                questionText: 'Type "YES" below to confirm and receive your certificate.',
+                options: ['YES', 'NO'],
+                correctAnswer: 'YES'
+            }]
+        };
+        
+        const certModule = {
+            title: 'Certificate Module',
+            description: 'Complete this quiz to receive your certificate.',
+            order: course.chapters.length,
+            isCertificateModule: true,
+            modules: [certQuizChapter]
+        };
+        
+        course.chapters.push(certModule);
+    }
+
+    // Fix ordering of all Modules
+    course.chapters.forEach((ch, i) => ch.order = i);
+    
+    // Clean up: only the very last Module should have the flag
     reassignCertificateModule(course);
 };
 
@@ -94,7 +120,8 @@ const processCourseForFrontend = (course) => {
                 chapterId: ch._id,
                 chapterTitle: ch.title,
                 totalLikes: (mod.baseLikes || 0) + (mod.likes?.length || 0),
-                isCertificateModule: mod.isCertificateModule || false,
+                // Certificate flag is on the Module (chapter), pass it to each chapter inside
+                moduleIsCertificate: ch.isCertificateModule || false,
                 // Hide correct answers from client
                 questions: mod.questions ? mod.questions.map(q => ({
                     _id: q._id,
@@ -395,6 +422,8 @@ router.post('/admin/create', adminOnly, async (req, res) => {
         delete payload.content;
         delete payload.quiz;
         const newItem = new BiteSizeCourse(payload);
+        // Auto-create certificate chapter as the last chapter in the course
+        ensureCertificateQuiz(newItem);
         await newItem.save();
         res.status(201).json({ message: "Created", course: newItem });
     } catch (err) {
@@ -421,6 +450,80 @@ router.delete('/admin/delete/:id', adminOnly, async (req, res) => {
         res.json({ message: "Deleted" });
     } catch (err) {
         res.status(500).json({ message: "Server Error" });
+    }
+});
+
+// ─── Admin: Reorder Modules (chapters) ───
+router.put('/admin/:courseId/chapters/reorder', adminOnly, async (req, res) => {
+    try {
+        const { courseId } = req.params;
+        const { chapterIds } = req.body; // Array of chapter IDs in new order
+        
+        if (!Array.isArray(chapterIds) || chapterIds.length === 0) {
+            return res.status(400).json({ message: "chapterIds array is required" });
+        }
+
+        const course = await BiteSizeCourse.findById(courseId);
+        if (!course) return res.status(404).json({ message: "Course not found" });
+
+        // Build new order map: id → position
+        const idOrderMap = {};
+        chapterIds.forEach((id, idx) => { idOrderMap[id.toString()] = idx; });
+
+        // Sort chapters by the provided order
+        course.chapters.sort((a, b) => {
+            const aOrder = idOrderMap[a._id.toString()] ?? -1;
+            const bOrder = idOrderMap[b._id.toString()] ?? -1;
+            return aOrder - bOrder;
+        });
+
+        // Fix ordering
+        course.chapters.forEach((ch, i) => ch.order = i);
+        
+        // Ensure certificate module stays at the end
+        ensureCertificateQuiz(course);
+        await course.save();
+
+        res.json({ message: "Modules reordered", course });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
+
+// ─── Admin: Reorder Chapters (modules) inside a Module ───
+router.put('/admin/:courseId/chapter/:chapterId/modules/reorder', adminOnly, async (req, res) => {
+    try {
+        const { courseId, chapterId } = req.params;
+        const { moduleIds } = req.body; // Array of module IDs in new order
+        
+        if (!Array.isArray(moduleIds) || moduleIds.length === 0) {
+            return res.status(400).json({ message: "moduleIds array is required" });
+        }
+
+        const course = await BiteSizeCourse.findById(courseId);
+        if (!course) return res.status(404).json({ message: "Course not found" });
+
+        const chapter = course.chapters.id(chapterId);
+        if (!chapter) return res.status(404).json({ message: "Chapter not found" });
+
+        // Build new order map: id → position
+        const idOrderMap = {};
+        moduleIds.forEach((id, idx) => { idOrderMap[id.toString()] = idx; });
+
+        // Sort modules by the provided order
+        chapter.modules.sort((a, b) => {
+            const aOrder = idOrderMap[a._id.toString()] ?? -1;
+            const bOrder = idOrderMap[b._id.toString()] ?? -1;
+            return aOrder - bOrder;
+        });
+
+        // Fix ordering
+        chapter.modules.forEach((m, i) => m.order = i);
+        await course.save();
+
+        res.json({ message: "Chapters reordered", course });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
     }
 });
 
@@ -526,6 +629,49 @@ router.post('/admin/:courseId/chapter/:chapterId/module', adminOnly, async (req,
         await course.save();
 
         res.status(201).json({ message: "Module added", course });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
+
+// ─── Admin: Update a Chapter (video/quiz) ───
+router.put('/admin/:courseId/chapter/:chapterId/module/:moduleId', adminOnly, async (req, res) => {
+    try {
+        const { courseId, chapterId, moduleId } = req.params;
+        const { type, title, description, thumbnail, videoUrls, questions } = req.body;
+
+        const course = await BiteSizeCourse.findById(courseId);
+        if (!course) return res.status(404).json({ message: "Course not found" });
+
+        const chapter = course.chapters.id(chapterId);
+        if (!chapter) return res.status(404).json({ message: "Chapter not found" });
+
+        const mod = chapter.modules.id(moduleId);
+        if (!mod) return res.status(404).json({ message: "Module not found" });
+
+        if (mod.type === 'video') {
+            if (title !== undefined) mod.title = title;
+            if (description !== undefined) mod.description = description;
+            if (thumbnail !== undefined) mod.thumbnail = thumbnail;
+            if (videoUrls !== undefined) {
+                mod.videoUrls = {
+                    bn: videoUrls.bn || mod.videoUrls?.bn || '',
+                    en: videoUrls.en || mod.videoUrls?.en || '',
+                    hi: videoUrls.hi || mod.videoUrls?.hi || ''
+                };
+            }
+        } else if (mod.type === 'quiz') {
+            if (questions !== undefined && Array.isArray(questions)) {
+                mod.questions = questions.map((q, i) => ({
+                    questionText: q.questionText || 'Question ' + (i + 1),
+                    options: q.options || ['', '', '', ''],
+                    correctAnswer: q.correctAnswer || ''
+                }));
+            }
+        }
+
+        await course.save();
+        res.json({ message: "Chapter updated", course });
     } catch (err) {
         res.status(400).json({ message: err.message });
     }

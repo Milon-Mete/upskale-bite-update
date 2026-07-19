@@ -24,17 +24,17 @@ const moduleSchema = new mongoose.Schema({
   baseLikes: { type: Number, default: 40 },
   likes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   // Quiz fields
-  questions: [questionSchema],
-  // Certificate flag — last module in course is auto-set as certificate
-  isCertificateModule: { type: Boolean, default: false }
+  questions: [questionSchema]
 });
 
-// Chapter Schema
+// Chapter Schema (user calls this a "Module" — a grouping of chapters)
 const chapterSchema = new mongoose.Schema({
   title: { type: String, required: true },
   description: { type: String, default: '' },
   order: { type: Number, default: 0 },
-  modules: [moduleSchema]
+  modules: [moduleSchema],
+  // Certificate flag — the last Module (chapter) in the course is the Certificate Module
+  isCertificateModule: { type: Boolean, default: false }
 });
 
 // Pricing Schema
