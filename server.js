@@ -305,16 +305,18 @@ app.get('/api/auth/google/callback', async (req, res) => {
 
     try {
         // Exchange authorization code for tokens
-        const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', {
-            code,
-            client_id: GOOGLE_CLIENT_ID,
-            client_secret: GOOGLE_CLIENT_SECRET,
-            redirect_uri: GOOGLE_REDIRECT_URI,
-            grant_type: 'authorization_code'
-        }, {
-            headers: { 'Content-Type': 'application/json' }
-        });
-
+const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', 
+    new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: GOOGLE_REDIRECT_URI,
+        grant_type: 'authorization_code'
+    }).toString(), 
+    {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    }
+);
         const { id_token, access_token } = tokenResponse.data;
 
         // Get user info from Google
@@ -388,10 +390,11 @@ app.get('/api/auth/google/callback', async (req, res) => {
         const newUserParam = isNewGoogleUser ? '&isNewGoogleUser=true' : '';
         res.redirect(`${FRONTEND_URL}/profile?googleLogin=success&user=${userJson}${newUserParam}`);
 
-    } catch (err) {
-        console.error('❌ Google OAuth callback error:', err.message);
-        res.redirect(`${FRONTEND_URL}/login?error=google_auth_error`);
-    }
+} catch (err) {
+    // This will print the EXACT reason Google rejected the token (e.g., "invalid_grant", "redirect_uri_mismatch")
+    console.error('❌ Google OAuth callback error:', err.response?.data || err.message);
+    res.redirect(`${FRONTEND_URL}/login?error=google_auth_error`);
+}
 });
 
 // ==========================================
