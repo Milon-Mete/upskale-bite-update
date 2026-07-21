@@ -8,6 +8,7 @@ const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const twilio = require('twilio');
 const helmet = require('helmet');
+const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const cron = require('node-cron');
 // 🛑 TEMPORARY TWILIO BYPASS STORE
@@ -39,7 +40,7 @@ app.use(helmet({
             scriptSrc: ["'self'", "'unsafe-inline'", "https://checkout.razorpay.com", "https://cdn.razorpay.com"],
             frameSrc: ["'self'", "https://api.razorpay.com", "https://checkout.razorpay.com"],
             imgSrc: ["'self'", "data:", "https://res.cloudinary.com", "https://*.cloudinary.com"],
-            connectSrc: ["'self'", "http://localhost:5000", "https://api.upskale.co", "https://upskale-1.onrender.com"],
+            connectSrc: ["'self'", "http://localhost:5000", "https://api.upskale.co", "https://upskale-1.onrender.com", "https://upskale-bite-update.onrender.com"],
             styleSrc: ["'self'", "'unsafe-inline'"],
         },
     },
@@ -49,7 +50,9 @@ const PORT = process.env.PORT || 5000;
 const allowedOrigins = [
   'http://localhost:5173',
   'https://upskal.netlify.app',
-  'https://upskale.co'
+  'https://upskale.co',
+  // 🔴 ADD YOUR NEW HOSTINGER/RENDER DOMAIN(S) HERE
+  // 'https://your-frontend-domain.com'
 ];
 
 app.set('trust proxy', 1);
@@ -283,25 +286,49 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 
 // Step 1: Redirect user to Google consent screen
 app.get('/api/auth/google', (req, res) => {
+    // 🔒 SECURITY: Generate random state parameter to prevent CSRF attacks
+    const state = crypto.randomBytes(32).toString('hex');
+    
+    // Store state in an httpOnly cookie (short-lived, 5 minutes)
+    res.cookie('oauth_state', state, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 5 * 60 * 1000 // 5 minutes
+    });
+
     const params = new URLSearchParams({
         client_id: GOOGLE_CLIENT_ID,
         redirect_uri: GOOGLE_REDIRECT_URI,
         response_type: 'code',
         scope: 'openid email profile',
         access_type: 'offline',
-        prompt: 'select_account'
+        prompt: 'select_account',
+        state: state
     });
     res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
 });
 
 // Step 2: Google redirects back here with a code
 app.get('/api/auth/google/callback', async (req, res) => {
-    const { code, error: oauthError } = req.query;
+    const { code, state, error: oauthError } = req.query;
 
     if (oauthError || !code) {
         console.error('❌ Google OAuth error:', oauthError);
         return res.redirect(`${FRONTEND_URL}/login?error=google_auth_failed`);
     }
+
+    // 🔒 SECURITY: Validate state parameter to prevent CSRF attacks
+    const storedState = req.cookies?.oauth_state;
+    if (!storedState || !state || storedState !== state) {
+        console.error('❌ OAuth state mismatch - possible CSRF attack');
+        // Clear the state cookie
+        res.cookie('oauth_state', '', { httpOnly: true, expires: new Date(0), secure: process.env.NODE_ENV === 'production', sameSite: 'lax' });
+        return res.redirect(`${FRONTEND_URL}/login?error=csrf_detected`);
+    }
+    
+    // Clear the state cookie immediately after validation
+    res.cookie('oauth_state', '', { httpOnly: true, expires: new Date(0), secure: process.env.NODE_ENV === 'production', sameSite: 'lax' });
 
     try {
         // Exchange authorization code for tokens
@@ -372,23 +399,15 @@ const tokenResponse = await axios.post('https://oauth2.googleapis.com/token',
 
         res.cookie('jwt', token, {
             httpOnly: true,
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+            secure: true,
+            sameSite: 'none',
             maxAge: 7 * 24 * 60 * 60 * 1000
         });
 
-        // Redirect to frontend with only essential user fields (no full document exposure)
-        const safeUser = {
-            _id: user._id,
-            name: user.name,
-            email: user.email,
-            authProvider: user.authProvider,
-            phone: user.phone,
-            role: user.role
-        };
-        const userJson = encodeURIComponent(JSON.stringify(safeUser));
+        // 🔒 SECURITY: Redirect WITHOUT user data in URL params
+        // JWT cookie is already set; frontend will fetch user via API
         const newUserParam = isNewGoogleUser ? '&isNewGoogleUser=true' : '';
-        res.redirect(`${FRONTEND_URL}/profile?googleLogin=success&user=${userJson}${newUserParam}`);
+        res.redirect(`${FRONTEND_URL}/profile?googleLogin=success${newUserParam}`);
 
 } catch (err) {
     // This will print the EXACT reason Google rejected the token (e.g., "invalid_grant", "redirect_uri_mismatch")
@@ -542,6 +561,47 @@ app.put('/api/user/:id', requireAuth, async (req, res) => {
     }
 });
 
+// 🔒 Shared helper: Fetch user with all related data (certificates, referrals)
+async function fetchUserWithRelatedData(userId) {
+    const userDoc = await User.findById(userId)
+        .populate({ path: 'referredBy', select: 'name _id' })
+        .populate({
+            path: 'enrolledCourses.item',
+            select: 'title highlight image thumbnail slug schedule meetingLink pricing'
+        })
+        .lean();
+
+    if (!userDoc) return null;
+
+    const [myCertificates, myReferrals] = await Promise.all([
+        Certificate.find({
+            $or: [{ user: userId }, { phone: userDoc.phone }]
+        }).sort({ issuedDate: -1 }).limit(50).lean(),
+        Referral.find({ referrerId: userId })
+            .populate('referredUserId', 'name _id createdAt')
+            .sort({ createdAt: -1 }).limit(50).lean()
+    ]);
+
+    userDoc.referralHistory = myReferrals;
+    userDoc.earnedCertificates = myCertificates;
+    return userDoc;
+}
+
+// 🔒 SECURITY: Get current authenticated user from JWT cookie (used by Google OAuth redirect)
+app.get('/api/user/me', requireAuth, async (req, res) => {
+    try {
+        if (!req.user || !req.user._id) {
+            return res.status(401).json({ message: "Not authenticated" });
+        }
+        const userDoc = await fetchUserWithRelatedData(req.user._id);
+        if (!userDoc) return res.status(404).json({ message: "User not found" });
+        res.json(userDoc);
+    } catch (err) {
+        console.error("User Me Route Error:", err);
+        res.status(500).json({ message: "Server Error" });
+    }
+});
+
 app.get('/api/user/:id', requireAuth, async (req, res) => {
     try {
         // 1. Strict Security Check
@@ -549,32 +609,9 @@ app.get('/api/user/:id', requireAuth, async (req, res) => {
             return res.status(403).json({ message: "Forbidden. You can only view your own profile." });
         }
 
-        // 2. Fetch Base User Data
-        const userDoc = await User.findById(req.params.id)
-            .populate({ path: 'referredBy', select: 'name _id' })
-            .populate({
-                path: 'enrolledCourses.item',
-                select: 'title highlight image thumbnail slug schedule meetingLink pricing' 
-            })
-            .lean();
-            
+        // 2. Use shared helper
+        const userDoc = await fetchUserWithRelatedData(req.params.id);
         if (!userDoc) return res.status(404).json({ message: "User not found" });
-
-        // 3. 🚀 PARALLEL EXECUTION: Fetch Certificates and Referrals at the exact same time
-        // Added .limit(50) to prevent unbounded RAM bloat
-        const [myCertificates, myReferrals] = await Promise.all([
-            Certificate.find({ 
-                $or: [{ user: req.params.id }, { phone: userDoc.phone }] 
-            }).sort({ issuedDate: -1 }).limit(50).lean(),
-            
-            Referral.find({ referrerId: req.params.id })
-                .populate('referredUserId', 'name _id createdAt') 
-                .sort({ createdAt: -1 }).limit(50).lean()
-        ]);
-
-        // 4. Assemble payload
-        userDoc.referralHistory = myReferrals; 
-        userDoc.earnedCertificates = myCertificates; 
 
         res.json(userDoc);
     } catch (err) { 
@@ -582,7 +619,6 @@ app.get('/api/user/:id', requireAuth, async (req, res) => {
         res.status(500).json({ message: "Server Error" }); 
     }
 });
-
 // 🔒 Added adminOnly to prevent massive data leak
 app.get('/api/admin/all-users', adminOnly, async (req, res) => {
   try {
