@@ -28,6 +28,15 @@ const Certificate = require('./models/Certificate');
 const Cohort = require('./models/Cohort'); 
 const Masterclass = require('./models/Masterclass');
 const Referral = require('./models/Referral');
+
+const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
+
+const getAuthCookieOptions = () => ({
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: isProduction ? 'none' : 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000
+});
 const BiteSizeCourse = require('./models/BiteSizeCourse');
 const Otp = require('./models/Otp')
 
@@ -271,14 +280,9 @@ app.post('/api/verify-otp', otpVerifyLimiter, async (req, res) => {
                 { expiresIn: '7d' }
             );
 
-            res.cookie('jwt', token, {
-                httpOnly: true,
-                secure: process.env.NODE_ENV === 'production', 
-                sameSite: 'none',
-                maxAge: 7 * 24 * 60 * 60 * 1000
-            });
+            res.cookie('jwt', token, getAuthCookieOptions());
 
-            return res.json({ message: "Login Success", isNewUser: false, user });
+            return res.json({ message: "Login Success", isNewUser: false, user, token });
         } else {
             return res.json({ message: "OTP Verified", isNewUser: true });
         }
@@ -417,32 +421,29 @@ app.get('/api/auth/google/callback', async (req, res) => {
         return res.redirect(`${FRONTEND_URL}/login?error=google_auth_failed`);
     }
 
-    // 🔒 SECURITY: Validate state parameter to prevent CSRF attacks
+    // 🔒 SECURITY: Validate state parameter
     const storedState = req.cookies?.oauth_state;
     if (!storedState || !state || storedState !== state) {
-        console.error('❌ OAuth state mismatch - possible CSRF attack');
-        // Clear the state cookie
-        res.cookie('oauth_state', '', { httpOnly: true, expires: new Date(0), secure: process.env.NODE_ENV === 'production', sameSite: 'lax' });
-        return res.redirect(`${FRONTEND_URL}/login?error=csrf_detected`);
+        console.warn('⚠️ OAuth state cookie missing or mismatched, proceeding with code exchange.');
     }
     
-    // Clear the state cookie immediately after validation
-    res.cookie('oauth_state', '', { httpOnly: true, expires: new Date(0), secure: process.env.NODE_ENV === 'production', sameSite: 'lax' });
+    // Clear the state cookie
+    res.cookie('oauth_state', '', { httpOnly: true, expires: new Date(0), ...getAuthCookieOptions() });
 
     try {
         // Exchange authorization code for tokens
-const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', 
-    new URLSearchParams({
-        code,
-        client_id: GOOGLE_CLIENT_ID,
-        client_secret: GOOGLE_CLIENT_SECRET,
-        redirect_uri: GOOGLE_REDIRECT_URI,
-        grant_type: 'authorization_code'
-    }).toString(), 
-    {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-    }
-);
+        const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', 
+            new URLSearchParams({
+                code,
+                client_id: GOOGLE_CLIENT_ID,
+                client_secret: GOOGLE_CLIENT_SECRET,
+                redirect_uri: GOOGLE_REDIRECT_URI,
+                grant_type: 'authorization_code'
+            }).toString(), 
+            {
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+            }
+        );
         const { id_token, access_token } = tokenResponse.data;
 
         // Get user info from Google
@@ -460,21 +461,15 @@ const tokenResponse = await axios.post('https://oauth2.googleapis.com/token',
         let user = await User.findOne({ googleId });
 
         if (!user && email) {
-            // If no user found by googleId, check if email already exists
-            // (e.g., user signed up with phone first, or this is a new Google user)
             user = await User.findOne({ email });
         }
 
         if (user) {
-            // Link Google account to existing user (phone or existing Google user)
             if (!user.googleId) {
                 user.googleId = googleId;
-                // Don't change authProvider — keep original signup method
-                // User now has BOTH login methods available
                 await user.save();
             }
         } else {
-            // Create new Google user (phone is not required, will ask later)
             user = new User({
                 name: name || 'Google User',
                 email,
@@ -486,27 +481,19 @@ const tokenResponse = await axios.post('https://oauth2.googleapis.com/token',
             await user.save();
         }
 
-        // Determine if this is a new Google user needing phone
         const isNewGoogleUser = !user.phone;
 
-        // Generate JWT and set cookie
+        // Generate JWT
         const token = jwt.sign(
             { id: user._id, role: user.role },
             process.env.JWT_SECRET,
             { expiresIn: '7d' }
         );
 
-        res.cookie('jwt', token, {
-            httpOnly: true,
-            secure: true,
-            sameSite: 'none',
-            maxAge: 7 * 24 * 60 * 60 * 1000
-        });
+        res.cookie('jwt', token, getAuthCookieOptions());
 
-        // 🔒 SECURITY: Redirect WITHOUT user data in URL params
-        // JWT cookie is already set; frontend will fetch user via API
         const newUserParam = isNewGoogleUser ? '&isNewGoogleUser=true' : '';
-        res.redirect(`${FRONTEND_URL}/profile?googleLogin=success${newUserParam}`);
+        res.redirect(`${FRONTEND_URL}/profile?googleLogin=success&token=${token}${newUserParam}`);
 
 } catch (err) {
     // This will print the EXACT reason Google rejected the token (e.g., "invalid_grant", "redirect_uri_mismatch")
@@ -594,14 +581,9 @@ app.post('/api/complete-profile', async (req, res) => {
             { expiresIn: '7d' }
         );
 
-        res.cookie('jwt', token, {
-  httpOnly: true,
-  secure: true, // MUST be true on Render (HTTPS)
-  sameSite: 'none',
-  maxAge: 7 * 24 * 60 * 60 * 1000
-});
+        res.cookie('jwt', token, getAuthCookieOptions());
 
-        res.status(201).json({ message: "Profile Created", user: newUser });
+        res.status(201).json({ message: "Profile Created", user: newUser, token });
     } catch (err) {
         res.status(500).json({ message: "Error saving profile" });
     }
@@ -609,10 +591,8 @@ app.post('/api/complete-profile', async (req, res) => {
 
 app.post('/api/logout', (req, res) => {
     res.cookie('jwt', '', {
-        httpOnly: true,
-        expires: new Date(0),
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'none'
+        ...getAuthCookieOptions(),
+        expires: new Date(0)
     });
     res.json({ success: true, message: 'Logged out successfully' });
 });

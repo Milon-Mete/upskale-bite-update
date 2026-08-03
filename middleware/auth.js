@@ -6,8 +6,9 @@ const BiteSizeCourse = require('../models/BiteSizeCourse');
 // 1. Authenticate any logged-in user
 const requireAuth = async (req, res, next) => {
     try {
-        // Read the token from the HttpOnly cookie
-        const token = req.cookies.jwt;
+        const authHeader = req.headers.authorization;
+        const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+        const token = req.cookies.jwt || bearerToken || req.query?.token;
 
         if (!token) {
             return res.status(401).json({ message: "Unauthorized: No token provided." });
@@ -17,7 +18,7 @@ const requireAuth = async (req, res, next) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         
         // Find the user and attach to the request object
-        const user = await User.findById(decoded.id).select('-password'); // Exclude password if you have one
+        const user = await User.findById(decoded.id).select('-password');
         if (!user) {
             return res.status(401).json({ message: "Unauthorized: User not found." });
         }
@@ -33,7 +34,9 @@ const requireAuth = async (req, res, next) => {
 // 2. Authenticate only Admins
 const adminOnly = async (req, res, next) => {
     try {
-        const token = req.cookies.jwt;
+        const authHeader = req.headers.authorization;
+        const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+        const token = req.cookies.jwt || bearerToken || req.query?.token;
 
         if (!token) {
             return res.status(401).json({ message: "Unauthorized: No token provided." });

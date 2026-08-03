@@ -150,6 +150,60 @@ router.post('/create-order', requireAuth, async (req, res) => {
         // Safety floor
         if (finalAmountToCharge < 0) finalAmountToCharge = 0;
 
+        // --- FREE MASTERCLASS ENROLLMENT (0 RS) ---
+        if (finalAmountToCharge === 0) {
+            const user = await User.findById(userId);
+            if (!user) return res.status(404).json({ success: false, message: "User not found" });
+
+            const alreadyEnrolled = user.enrolledCourses.some(
+                enrollment => enrollment.item && enrollment.item.toString() === masterclass._id.toString()
+            );
+
+            if (!alreadyEnrolled) {
+                user.enrolledCourses.push({
+                    item: masterclass._id,
+                    itemModel: 'Masterclass',
+                    paymentStatus: 'full',
+                    amountPaid: 0,
+                    purchasedAt: new Date()
+                });
+                await user.save();
+
+                await Masterclass.findByIdAndUpdate(masterclass._id, {
+                    $inc: { enrolledCount: 1 }
+                });
+            }
+
+            if (appliedCouponData.code) {
+                await Coupon.findOneAndUpdate(
+                    { code: appliedCouponData.code },
+                    { $inc: { usedCount: 1 } }
+                );
+            }
+
+            const freeOrder = new Order({
+                userId: userId,
+                item: masterclass._id,
+                itemModel: 'Masterclass',
+                amount: 0,
+                basePrice: basePrice,
+                amountPaid: 0,
+                appliedCoupon: appliedCouponData.code ? appliedCouponData : undefined,
+                appliedPromotions: appliedPromotionsData.length > 0 ? appliedPromotionsData : [],
+                razorpayOrderId: `free_mc_${Date.now()}_${userId.toString().slice(-4)}`,
+                status: 'paid',
+                fulfilledVia: 'free_enrollment'
+            });
+            await freeOrder.save();
+
+            return res.json({
+                success: true,
+                isFree: true,
+                message: "Enrolled in free masterclass successfully!",
+                title: masterclass.title
+            });
+        }
+
         // --- RAZORPAY CREATION ---
         const options = {
             amount: Math.round(finalAmountToCharge * 100), 
