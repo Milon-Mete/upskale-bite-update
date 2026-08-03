@@ -106,12 +106,16 @@ const otpVerifyLimiter = rateLimit({
 });
 
 
+// ==========================================
+// 📱 AISENSY WHATSAPP OTP VERIFICATION
+// ==========================================
+
 app.post('/api/send-otp', otpSendLimiter, async (req, res) => {
     let { phone } = req.body;
     
     if (!phone) return res.status(400).json({ message: "Phone number required" });
 
-    // Force E.164 Format
+    // Force E.164 Format: +91XXXXXXXXXX
     let cleanPhone = phone.replace(/[\s-]/g, '');
     if (cleanPhone.length === 10) cleanPhone = `+91${cleanPhone}`; 
     else if (cleanPhone.length === 12 && cleanPhone.startsWith('91')) cleanPhone = `+${cleanPhone}`;   
@@ -121,23 +125,107 @@ app.post('/api/send-otp', otpSendLimiter, async (req, res) => {
     }
 
     try {
-        // 🛑 BYPASS TWILIO: Generate a random 6-digit OTP
+        // Generate a random 6-digit OTP
         const generatedOtp = Math.floor(100000 + Math.random() * 900000).toString();
         
-        // Save to temporary memory, expires in 5 minutes
+        // Save to temporary memory store, expires in 5 minutes
         tempOtpStore.set(cleanPhone, generatedOtp);
         setTimeout(() => tempOtpStore.delete(cleanPhone), 5 * 60 * 1000);
 
-        // 🔴 LOG TO CONSOLE
-        console.log(`\n========================================`);
-        console.log(`🛑 TWILIO BYPASS ACTIVE`);
-        console.log(`📱 Sending OTP to: ${cleanPhone}`);
-        console.log(`🔑 YOUR OTP IS:    ${generatedOtp}`);
-        console.log(`========================================\n`);
+        // Also save to MongoDB Otp collection for persistence across restarts
+        try {
+            await Otp.findOneAndUpdate(
+                { phone: cleanPhone },
+                { otp: generatedOtp, createdAt: new Date() },
+                { upsert: true, new: true }
+            );
+        } catch (dbErr) {
+            console.warn("⚠️ Otp DB Save Warning:", dbErr.message);
+        }
 
-        res.json({ success: true, message: "OTP logged in server console", status: 'pending' });
+        const aisensyApiKey = process.env.AISENSY_API_KEY;
+        const aisensyCampaignName = process.env.AISENSY_CAMPAIGN_NAME || "otp_verification";
+
+        // Check if active Aisensy Key is provided in .env
+        if (aisensyApiKey && aisensyApiKey !== 'YOUR_AISENSY_API_KEY' && aisensyApiKey.trim() !== '') {
+            // Aisensy requires destination in format without '+' e.g. 919876543210
+            const destinationNumber = cleanPhone.replace('+', '');
+
+            const aisensyPayload = {
+                apiKey: aisensyApiKey,
+                campaignName: aisensyCampaignName,
+                destination: destinationNumber,
+                userName: "User",
+                templateParams: [generatedOtp],
+                source: "UPSKALE_APP",
+                media: {},
+                buttons: [
+                    {
+                        type: "button",
+                        sub_type: "url",
+                        index: 0,
+                        parameters: [
+                            {
+                                type: "text",
+                                text: generatedOtp
+                            }
+                        ]
+                    }
+                ],
+                carouselCards: [],
+                location: {},
+                attributes: {},
+                paramsFallbackValue: {
+                    FirstName: "User"
+                }
+            };
+
+            try {
+                console.log(`[Aisensy API] Sending OTP to ${destinationNumber} via campaign '${aisensyCampaignName}'...`);
+                const aisensyResponse = await axios.post('https://backend.aisensy.com/campaign/t1/api/v2', aisensyPayload, {
+                    headers: { 'Content-Type': 'application/json' },
+                    timeout: 10000
+                });
+                
+                console.log(`[Aisensy API Success]`, aisensyResponse.data);
+                
+                return res.json({ 
+                    success: true, 
+                    message: "OTP sent successfully via WhatsApp (Aisensy)", 
+                    status: 'sent' 
+                });
+            } catch (aisensyErr) {
+                console.error("❌ Aisensy API Call Error:", aisensyErr.response?.data || aisensyErr.message);
+                
+                // Console Fallback mode if Aisensy API fails or is unconfigured
+                console.log(`\n========================================`);
+                console.log(`⚠️ AISENSY FALLBACK ACTIVE (Check API credentials)`);
+                console.log(`📱 Phone: ${cleanPhone}`);
+                console.log(`🔑 YOUR OTP IS: ${generatedOtp}`);
+                console.log(`========================================\n`);
+
+                return res.json({ 
+                    success: true, 
+                    message: "OTP generated (Console Fallback mode active)", 
+                    status: 'pending' 
+                });
+            }
+        } else {
+            // Console Bypass/Dev Mode
+            console.log(`\n========================================`);
+            console.log(`🛑 AISENSY DEV / BYPASS MODE ACTIVE`);
+            console.log(`📱 Sending OTP to: ${cleanPhone}`);
+            console.log(`🔑 YOUR OTP IS:    ${generatedOtp}`);
+            console.log(`========================================\n`);
+
+            return res.json({ 
+                success: true, 
+                message: "OTP generated in server console mode", 
+                status: 'pending' 
+            });
+        }
     } catch (error) {
-        console.error("❌ Send Error:", error.message);
+        console.error("❌ Send OTP Error:", error.message);
         res.status(500).json({ message: "Failed to generate OTP", error: error.message });
     }
 });
@@ -152,17 +240,28 @@ app.post('/api/verify-otp', otpVerifyLimiter, async (req, res) => {
     else if (cleanPhone.length === 12 && cleanPhone.startsWith('91')) cleanPhone = `+${cleanPhone}`;
 
     try {
-        // 🛑 BYPASS TWILIO: Check our temporary memory store
-        const validOtp = tempOtpStore.get(cleanPhone);
+        // First check in-memory store
+        let validOtp = tempOtpStore.get(cleanPhone);
 
-        if (!validOtp || validOtp !== otp.toString()) {
+        // If not in memory store, check MongoDB Otp model
+        if (!validOtp) {
+            const otpDoc = await Otp.findOne({ phone: cleanPhone });
+            if (otpDoc) validOtp = otpDoc.otp;
+        }
+
+        if (!validOtp || validOtp !== otp.toString().trim()) {
             return res.status(400).json({ message: "Invalid or Expired OTP" });
         }
 
-        // OTP matches. Clear it from memory so it can't be reused.
+        // OTP matches: clear from memory and MongoDB
         tempOtpStore.delete(cleanPhone);
+        try {
+            await Otp.deleteOne({ phone: cleanPhone });
+        } catch (dbErr) {
+            console.warn("⚠️ Otp DB cleanup warning:", dbErr.message);
+        }
 
-        // Proceed to lookup user in DB
+        // Lookup user in DB
         const user = await User.findOne({ phone: cleanPhone }); 
         
         if (user) {
@@ -174,7 +273,7 @@ app.post('/api/verify-otp', otpVerifyLimiter, async (req, res) => {
 
             res.cookie('jwt', token, {
                 httpOnly: true,
-                secure: true, 
+                secure: process.env.NODE_ENV === 'production', 
                 sameSite: 'none',
                 maxAge: 7 * 24 * 60 * 60 * 1000
             });
